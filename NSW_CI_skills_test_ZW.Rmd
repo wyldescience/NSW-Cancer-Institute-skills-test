@@ -1,0 +1,657 @@
+---
+title: "NSW Cancer Institute Skills Test (HSM2)"
+author: "Dr Zac Wylde"
+date: "18/11/2021"
+output: 
+  html_document:
+    code_folding: hide
+    highlight: pygments
+    theme: united
+---
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(fig.retina = 2)
+```
+*This script uses artificial data from the Simulacrum, a synthetic dataset developed by Health Data Insight CiC derived from anonymous cancer data provided by the National Cancer Registration and Analysis Service, which is part of Public Health England.*
+
+Data accessed from: [simulacrum](https://simulacrum.healthdatainsight.org.uk/using-the-simulacrum/requesting-data/)
+
+## Load R Packages
+
+
+``` {r results='hide', message=F, warning=F}
+library(tidyverse)
+library(janitor)
+library(kableExtra)
+library(lubridate)
+library(freqtables)
+library(pwr)
+library(plotrix)
+library(data.table)
+library(ggpubr)
+library(sjPlot)
+library(lmerTest)
+library(DHARMa)
+library(ggstatsplot)
+```
+
+
+## Load and check synthetic cancer registration and SACT data for 2013-2015.
+*see simulacrum_data_dictionary for definitions.*
+
+**Patient data:**
+Includes patient demographics from the registry, vital status date and cause of death. Contains Link_Number which allows linkage to SIM_SACT_PATIENT.
+``` {r results='hide', message=F, warning=F}
+## patient data
+pat <- read.csv("sim_av_patient.csv") 
+## contains sex, patient id, ethnicity, causes of death, death location, vital status and other demographic/clinical info
+
+pat <- clean_names(pat) 
+## returns names in lowercase with _ as separator etc for easier coding, easier life!
+
+names(pat)
+str(pat)
+ 
+names <- c('patientid', 'sex', 'ethnicity', 'deathcausecode_1a', 'deathcausecode_1b',
+           'deathcausecode_2', 'deathcausecode_1c', 'deathcausecode_underlying','deathlocationcode', 'newvitalstatus', 'vitalstatusdate')
+pat[,names] <- lapply(pat[,names] , factor)
+str(pat)
+## change these columns to factors (link number for cross-linkage with other data sets and not of interest here)
+
+pat <- pat %>% mutate_all(na_if,"")
+## change empty values to NA
+
+levels(pat$sex)
+## sex codes in zsex patients file only inclusive of 1, 2, 9 where 1 = Male, 2 = Female, 9 = Not specified
+pat <- pat %>% mutate(sex=recode(sex, 
+                         '1' = "Male",
+                         '2' = "Female",
+                         '9' = "Unspecified"))
+
+## recoded values for sex for easier plotting/tables later.
+```
+
+**Tumour data:**
+Main tumour table containing details for each tumour registered.  Each patient may have more than one tumour. Includes tumourid, age at diagnosis, screening status,  demographics, tumour site,  staging, TNM staging, grade, tumour morphology, performance status, hormone receptor status, surgery date and deprivation index.
+```{r message=FALSE, warning=FALSE, results='hide'}
+## tumour data
+tum <- read.csv("sim_av_tumour.csv")
+## contains tumour/patient ids, diagnosis date, a number of morphological measures of tumour, grade, sex of patient, 
+## SITE_ICD10_O2_3CHAR = site of neoplasm (C34 = lung cancer), comorbidity scores, 
+
+tum <- clean_names(tum)
+
+str(tum)
+
+names2 <- c('tumourid', 'patientid', 'diagnosisdatebest', 'site_icd10_o2', 'site_icd10_o2_3char','morph_icd10_o2', 'behaviour_icd10_o2',
+           'grade', 'age', 'sex','creg_code', 'linknumber')
+tum[,names2] <- lapply(tum[,names2] , factor)
+str(tum)
+tum <- tum %>% mutate_all(na_if,"")
+## change empty values to NA
+```
+
+<p>&nbsp;</p>
+# 1. Analysing data
+<p>&nbsp;</p>
+### **(a) What is the sex distribution of patients?**
+<p>&nbsp;</p>
+
+Proportion of male and female cancer patients. Assumed that "Unspecified" sex is simply missing data (n = 2) and was thus removed from this dataset. This assumption may be incorrect and possibly represents non-binary or intersex patients who do not identify as male/female.
+```{r results='show', message=F, warning=F}
+## table of proportion of males to females (not quite sure exactly how I was supposed to get distribution asked for in brief)
+pat1 <- subset(pat, sex == "Male" | sex == "Female")
+## because Unspecified is only two observations these were removed
+
+pat1$sex <- droplevels(pat1$sex)
+## df still has observations for unspecified (0) need to remove.
+
+tab1 <- pat1 %>%
+  group_by (sex) %>%
+  summarise (n=n()) %>%
+  mutate("Relative Proportion" = paste0(round(100 * n/sum(n), 0), "%"))
+
+table_1 <- tab1 %>%
+  kbl() %>%
+  kable_styling(c("striped", "hover"), full_width = F)
+table_1
+```
+
+#### Is the difference between the proportion of males and females with cancer significant?
+Run basic test for equality of proportions.
+On face value, the analysis below indicates that this difference is highly significant, suggesting that females are relatively over represented in this data when compared to males.
+```{r results='show', message=F, warning=F}
+con_tab <- pat1 %>% freq_table(sex)
+## create contingency table to look at relative numbers of male & female patients.
+
+p1 <- prop.test(con_tab$n, con_tab$n_total, p = NULL, correct = F)
+
+p1
+```
+#### Calculate Cohen's *h* effect size for difference between proportions, especially important when examining data with large sample sizes.
+The effect size of the difference between proportions is very small (*h* = 0.045) suggesting that even though we rejected the null hypothesis above, the size of the difference between the two proportions is negligible.
+```{r results='show', message=F, warning=F}
+h<-ES.h(0.5111618, 0.4888382)
+
+h
+```
+<p>&nbsp;</p>
+
+### **(b) Prepare dataset with all lung cancer patients and their cause of death**
+See [definitions here](https://datadictionary.nhs.uk/data_elements/death_cause_icd_code.html).
+<p>&nbsp;</p>
+
+Subset "site_icd10_o2_3char = C34" from tumour data then migrate to patient dataset.
+```{r results='hide', message=F, warning=F}
+
+t1 <- subset(tum, site_icd10_o2_3char == "C34")
+## subset tumour data that is only lung cancer patients
+
+pat$site_icd10_o2_3char = t1$site_icd10_o2_3char[match(pat$patientid, t1$patientid)]
+## match patient id across data sets and add "site_icd10_o2_3char"
+```
+
+Migrate diagnosis date from tumour to patient data then calculate number of days of survival post diagnosis.
+```{r results='hide', message=F, warning=F}
+
+pat$diagnosisdatebest = tum$diagnosisdatebest[match(pat$patientid, tum$patientid)]
+## match patient id across data sets and add "diagnosisdatebest"
+
+pat$vitalstatusdate <- as.Date(pat$vitalstatusdate)
+pat$diagnosisdatebest <- as.Date(pat$diagnosisdatebest)
+## make sure R is reading dates properly
+
+pat$survival <- pat$vitalstatusdate - pat$diagnosisdatebest
+## deduct dates to get number of days of survival from diagnosis so that can calculate mean survival.
+
+```
+
+Create final data that only includes lung cancer patients and their causes of death.
+```{r results='hide', message=F, warning=F}
+
+
+finalb <- subset(pat, site_icd10_o2_3char == "C34")
+## subset only lung cancer patients
+
+write.csv(finalb, "lung_cancer.csv", row.names = F)
+## write new data to csv file
+```
+
+### **(c) Calculate mean survival time in days for the lung cancer patients who were diagnosed in 2013**
+
+First need to subset by patients that were only diagnosed in 2013.
+```{r results='hide', message=F, warning=F}
+
+pat_lc_2013 <- finalb[year(finalb$diagnosisdatebest) == 2013,]
+## using lubridate package subset by year 2013
+```
+
+
+Calculate total mean survival time for lung cancer patients (regardless of sex) who were diagnosed in 2013.
+Not surprisingly the standard deviation is very large indicating that means may not be best measure of central tendency (median would be better). Data is binomial perhaps suggesting that patients who are dead at new vital status had more aggressive cancers and thus shorter survival time.
+Could also be an artefact of diagnosis date & stage of lung cancer at that date. i.e., cancers detected when in late stages results in shorter survival time and probability of survival. 
+
+```{r results='show', message=F, warning=F}
+tab2 <- pat_lc_2013 %>%
+  summarise ("survival.mean" = mean(survival, na.rm = T), "survival.sd" = sd(survival), "survial.se" = std.error(survival))
+
+(table_2 <- tab2 %>%
+  kbl() %>%
+  kable_styling(c("striped", "hover"), full_width = F))
+```
+
+Visualise distribution of data for both alive and deceased patients.
+```{r results='show', message=F, warning=F}
+
+pat_lc_2013$survival <- as.numeric(pat_lc_2013$survival)
+##ggplot doesn't like "time diff" format so much so converted to numeric.
+
+(gg1 <- gghistogram(na.omit(pat_lc_2013), x = "survival",
+   add = "mean", rug = TRUE,
+   fill = "sex", palette = c("#00AFBB", "#E7B800"),
+   title = "Counts of Survival Time for \n Alive & Deceased Patients at New Vital Status",
+   xlab = "Survival (days)"))
+
+```
+
+Noted that total mean estimate above is conservative as many individuals were alive on last follow up (n = 9358). Individuals that were dead at vital status were 27707. I assume X (exit posting) means that the patient left or moved somewhere else, could not find definition but only n = 16.
+
+Group by vitalstatusdate and calculate means (regardless of sex).
+```{r results='show', message=F, warning=F}
+sum1 <- summary(pat_lc_2013$newvitalstatus)
+
+tab4 <- data.table(aggregate(survival ~ newvitalstatus, data = pat_lc_2013, 
+          FUN = function(x) c(mean = mean(x, na.rm = T), sd = sd(x), se = std.error(x))))
+(table_4 <- tab4 %>%
+  kbl() %>%
+  kable_styling(c("striped", "hover"), full_width = F))
+```
+
+Calculate mean survival but stratified by sex (out of curiosity)
+```{r results='show', message=F, warning=F}
+tab3 <- data.table(aggregate(survival ~ sex, data = pat_lc_2013, 
+          FUN = function(x) c(mean = mean(x, na.rm = T), sd = sd(x), se = std.error(x))))
+
+(table_3 <- tab3 %>%
+  kbl() %>%
+  kable_styling(c("striped", "hover"), full_width = F))
+```
+
+Visualise distributions for alive and dead patients separately and group by sex with means for each. Data is not normally distributed and shows a lot of variability. 
+```{r results='show', message=F, warning=F}
+sub1 <- subset(pat_lc_2013, newvitalstatus == "A")
+gg2 <- gghistogram(na.omit(sub1), x = "survival",
+   add = "mean", rug = TRUE,
+   fill = "sex", palette = c("#00AFBB", "#E7B800", "#69b3a2"),
+   title = "Counts of Survival Time for \n Alive Patients at \n New Vital Status",
+   xlab = "Survival (days)")
+
+sub2 <- subset(pat_lc_2013, newvitalstatus == "D")
+gg3 <- gghistogram(na.omit(sub2), x = "survival",
+   add = "mean", rug = TRUE,
+   fill = "sex", palette = c("#00AFBB", "#E7B800", "#69b3a2"),
+   title = "Counts of Survival Time for \n Deceased Patients at \n New Vital Status",
+   xlab = "Survival (days)")
+
+ggarrange(gg2, gg3, ncol = 2)
+```
+
+
+# Visualising Data
+
+### **(a) Visualise proportion of all ethnic groups among non-British male patients.**
+
+*See https://datadictionary.nhs.uk/attributes/ethnic_category_code_2001.html for ethnic code definitions.*
+<p>&nbsp;</p>
+Data wrangling to rename factor levels and subset to only non-British male patients, calculate proportions.
+```{r results='hide', message=F, warning=F}
+lev <- levels(pat$ethnicity)
+pat <- pat %>% mutate(ethnicity=recode(ethnicity, '0' = "White", '8' = "Other",'A' = "White British", 'B' = "White Irish", 'CA' = "English",
+                                       'C' = "White Other", 'D' = "Mixed Other White", 'E' = "Mixed White African", 'F' = "Mixed White Asian",
+                                       'G' = "Mixed Any Other", 'H' = "Indian British", 'J' = "Pakistani British", 'K' = "Bangladeshi British",
+                                       'L' = "Asian British", 'M' = "Carribbean British", 'N' = "African British", 'P' = "Black British Other",
+                                       'R' = "Chinese", 'S' = "Other Ethnic Groups",'X' = "Not Known", 'Z' = "Not Stated"))
+## recoded levels for plotting on complete data in case want to look at trends in females later
+
+male <- subset(pat, sex == "Male")
+## subset to only males from full data (not just 2013)
+
+male2 <- subset(male, ethnicity == c("White", "White Irish", "White Other", "Mixed Other White", "Mixed White African", "Mixed White Asian",
+                                     "Mixed Any Other", "Chinese", "Other Ethnic Groups", "Other", "Not known", "Not Stated"))
+## subset to exclude British males
+
+mal_ethn_prop <- male2 %>% group_by(ethnicity) %>%
+  summarise(n = length(ethnicity)) %>%
+  mutate(proportion = 100*n/sum(n))
+## calculate n and proportions of each group
+
+sum(mal_ethn_prop$proportion)
+## double check proportions add to 100
+```
+
+Plot relative proportions. Ideally these proportions should be weighted by relative population size of each ethnicity group.
+```{r results='hide', message=F, warning=F, fig.width = 10, fig.height = 10}
+
+gg4 <-ggbarplot(mal_ethn_prop, x = "ethnicity", y = "proportion",
+          fill = "#33A02C",           
+          color = "#33A02C",            
+          sort.val = "asc",
+          label = F, label.pos = "in",
+          position = position_dodge(0.9),
+          lab.nb.digits = 2,
+          lab.pos = "out",                  
+          sort.by.groups = FALSE,     
+          x.text.angle = 90,
+          xlab = "NHS ethnicity category code",
+          ylab = "Proportion of cases (%)",
+          title = "Proportion of Non-British Ethnicities in Male Cancer patients",
+          subtitle = "UK (2013-2015)",
+          rotate = TRUE,
+          ggtheme = theme_minimal()
+          )
+
+
+gg5 <- gg4 + rremove("grid") + rremove("y.text") + theme_pubr() +
+   font("title", size = 18, color = "black", face = "bold") +
+ font("subtitle", size = 16, color = "orange") +
+ font("xlab", size = 14, color = "black", face = "bold") +
+ font("ylab", size = 14, color = "black", face = "bold") +
+ font("xy.text", size = 10, color = "black", face = "bold")
+
+gg5
+```
+<p>&nbsp;</p>
+
+### **(b) Data exploration**
+
+# Examining predictors of survival in brain cancer patients from 2013-2015.
+
+*I became interested in examining the factors that might influence survival time in patients that have brain cancer (ICD10 = C71). See details below for analysis and visualisations.*
+<p>&nbsp;</p>
+
+#### Data wrangling to add factors of interest.
+```{r results='hide', message=F, warning=F}
+
+pat$age = tum$age[match(pat$patientid, tum$patientid)]
+## migrate age from tumour and match to patient id
+
+pat$grade = tum$grade[match(pat$patientid, tum$patientid)]
+## migrate grade of tumour to patient data set.
+
+pat$date_first_surgery = tum$date_first_surgery[match(pat$patientid, tum$patientid)]
+## migrate date of first surgery could be informative predictor of surivival
+
+pat$date_first_surgery <- as.Date(pat$date_first_surgery)
+## code as factor
+pat$post_diag_surgery <- pat$date_first_surgery - pat$diagnosisdatebest
+
+pat$post_diag_surgery <- as.numeric(pat$post_diag_surgery)
+##deduct date of diagnosis from date of first surgery to get number of days.
+
+pat$site_icd10_o2_3char = tum$site_icd10_o2_3char[match(pat$patientid, tum$patientid)]
+## match patient id across data sets and add "cancer types"
+
+```
+
+Classification of surgery both pre, on day of and post diagnosis binned into no.days categories.
+```{r results='hide', message=F, warning=F}
+
+
+sub4 <- subset(pat, post_diag_surgery < 0) ## prior to diagnosis
+sub4$surg_cat <- 'Prior to diagnosis'
+
+sub5 <- subset(pat, post_diag_surgery == 0) ## on day of diagnosis
+sub5$surg_cat <- 'On day of diagnosis'
+
+sub6 <- subset(pat, post_diag_surgery >= 1 & post_diag_surgery <= 28) ## surgery within 1 month of diagnosis
+sub6$surg_cat <- '1 month'
+
+sub7 <- subset(pat, post_diag_surgery >= 29 & post_diag_surgery <= 84) ## surgery within 3 months
+sub7$surg_cat <- '3 month'
+
+sub8 <- subset(pat, post_diag_surgery >= 85 & post_diag_surgery <= 168) ## surgery within 6 months
+sub8$surg_cat <- '6 month'
+
+sub9 <- subset(pat, post_diag_surgery >= 169 & post_diag_surgery <= 336) ## surgery within 12 months
+sub9$surg_cat <- '12 month'
+
+sub10 <- subset(pat, post_diag_surgery >= 337) ## surgery over 12 months
+sub10$surg_cat <- '12 months +'
+
+sub11 <- rbind(sub4, sub5, sub6, sub7, sub8, sub9, sub10)
+
+sub11$age <- as.numeric(sub11$age)
+sub11$surg_cat <- as.factor(sub11$surg_cat)
+```
+
+Create age classifications if want to use brackets instead of continuous.
+```{r results='hide', message=F, warning=F}
+
+a1 <- subset(sub11, age >= 0 & age <= 14) ## children (no children with skin cancer in data set but if want to test other cancers)
+a1$age_cat <- 'Children'
+
+a2 <- subset(sub11, age >= 15 & age <= 24) ## Youth
+a2$age_cat <- 'Youth'
+
+a3 <- subset(sub11, age >= 25 & age <= 64) ## adult
+a3$age_cat <- 'Adult'
+
+a4 <- subset(sub11, age >= 65) ## senior
+a4$age_cat <- 'Senior'
+
+newdat <- rbind(a1, a2, a3, a4)
+
+```
+
+Add in comorbidity and recode factor levels.
+```{r results='hide', message=F, warning=F}
+
+newdat$comorbid = as.factor(tum$ace27[match(newdat$patientid, tum$patientid)])
+levels(newdat$comorbid)
+## 1m, 2m, 3m not listed in look up, assume they are mild, moderate and severe (typos)
+newdat <- newdat %>% mutate(comorbid=recode(comorbid, 
+                         '0' = "None",
+                         '1' = "Mild",
+                         '2' = "Moderate",
+                         '3' = "Severe",
+                         '9' = "Unknown",
+                         '1m' = "Mild",
+                         '2m' = "Moderate",
+                         '3m' = "Severe"))
+```
+
+
+Add in behaviour of tumour and recode factor levels.
+```{r results='hide', message=F, warning=F}
+
+newdat$tum_behav = tum$behaviour_icd10_o2[match(newdat$patientid, tum$patientid)]
+
+newdat <- newdat %>% mutate(tum_behav=recode(tum_behav, 
+                         '0' = "Benign",
+                         '1' = "Uncertain",
+                         '2' = "In situ",
+                         '3' = "Malignant",
+                         '5' = "Micro-invasive",
+                         '6' = "Malignant metastatic",
+                         '9' = "Malignant uncertain",
+                         'X' = "Unknown/inapplicable"))
+```
+
+
+Add in drug groups
+```{r results='hide', message=F, warning=F}
+drug <- read.csv("sim_sact_drug_detail.csv")
+
+drug <- clean_names(drug) 
+
+newdat$drug = as.factor(drug$drug_group[match(newdat$patientid, drug$merged_patient_id)])
+```
+
+Final data wrangling and checking of data structures.
+```{r results='hide', message=F, warning=F}
+newdat3 <- subset(newdat, site_icd10_o2_3char == "C71")
+
+
+newdat3$survival <- as.numeric(newdat3$survival)
+## change survival again to be numeric
+
+str(newdat3)
+## check data structures
+
+names3 <- c('vitalstatusdate', 'diagnosisdatebest', 'date_first_surgery', 'age_cat', 'comorbid')
+newdat3[,names3] <- lapply(newdat3[,names3] , factor)
+str(newdat3)
+## change to factors
+
+newdat4 <- newdat3[ -c(5:10) ]
+## drop factors not using for cleanliness!
+```
+
+<p>&nbsp;</p>
+
+## Exploration of patterns in data.
+
+A quick look at effects of chemo drugs on survival (not included in model below) but seems to show some interesting trends.
+```{r results='show', message=F}
+
+## plot
+gg9 <- ggdotplotstats(
+  data = newdat4,
+  y = drug,
+  x = survival,
+  type = "bayes",
+  title = "Effects of Different Drug Compounds \n on Survival in Brain Cancer Patients \n UK 2013-2015",
+  xlab = "Survival Time (days)",
+  ylab = "Drugs Administered During Treatment",
+  caption = substitute(
+    paste(
+      italic("Source"),
+      ":Dataset from simulacrum.healthdatainsight.org.uk"
+    )
+  )
+)
+
+gg9
+```
+
+Effect of time until first surgery on survival.
+```{r results='show', message=F, warning=F}
+
+## plot
+
+newdat4$surg_cat <- fct_relevel(newdat4$surg_cat, "On day of diagnosis", "1 month", "3 month", "6 month", "12 month", "12 month +")
+
+gg6 <- ggdotplotstats(
+  data = newdat4,
+  y = surg_cat,
+  x = survival,
+  type = "bayes",
+  title = "Effect of Time Until First Surgery on Brain Cancer Survival \n UK 2013-2015",
+  xlab = "Survival Time (days)",
+  ylab = "Time Until First Surgery (days)",
+  caption = substitute(
+    paste(
+      italic("Source"),
+      ":Dataset from simulacrum.healthdatainsight.org.uk"
+    )
+  )
+)
+gg6
+```
+
+Effect of Age on survival (using binned ages).
+```{r results='show', message=F, warning=F}
+
+## plot
+gg7 <- ggdotplotstats(
+  data = newdat4,
+  y = age_cat,
+  x = survival,
+  type = "bayes",
+  title = "Effect of Age at Diagnosis on Brain Cancer Survival \n UK 2013-2015",
+  xlab = "Survival Time (days)",
+  ylab = "Age Category",
+  caption = substitute(
+    paste(
+      italic("Source"),
+      ":Dataset from simulacrum.healthdatainsight.org.uk"
+    )
+  )
+)
+
+
+gg7
+```
+
+Comorbidity and survival- something does not seem right here would have expected opposite patterns.
+```{r results='show', message=F, warning=F}
+
+## plot
+gg8 <- ggdotplotstats(
+  data = newdat4,
+  y = comorbid,
+  x = survival,
+  type = "bayes",
+  title = "Effects of Comorbidities on Survivial in Brain Cancer Patients \n UK 2013-2015",
+  xlab = "Survival Time (days)",
+  ylab = "ACE Comorbidity Score",
+  caption = substitute(
+    paste(
+      italic("Source"),
+      ":Dataset from simulacrum.healthdatainsight.org.uk"
+    )
+  )
+)
+gg8
+```
+
+## Generalised Mixed Model for Survival
+
+I then decided to run a GLMM (preference would be in a Bayesian framework but computer too slow) to see if I could detect any significant effects of age, sex, comorbidities, the time until first surgery and their interactions on the probability of survival for patients with brain cancer.
+
+I controlled for diagnosis date and date of surgery by including as random effects. I did not run a formal model building procedure to choose the best fitting model so please interpret these findings with caution. Diagnostic plot of residuals below suggests the model does not violate assumptions (tests show significance because of large N but residuals fit line nicely suggesting otherwise).
+```{r results='show', message=F, warning=F, fig.align = 'center', fig.width = 5}
+
+lm1 <- glmer(survival ~  age + sex + post_diag_surgery + comorbid + age*post_diag_surgery + age*comorbid +
+            sex*comorbid + post_diag_surgery*comorbid + (1|diagnosisdatebest) + (1|date_first_surgery),
+            family = "poisson",
+            data = newdat4)
+simulationOutput <- simulateResiduals(fittedModel = lm1, plot = T) ## diagnostics showing sig for KS, disperson and outlier because of large N, model looks fine from residual plot.
+
+```
+
+Table Showing the fixed effects and their interactions on survival in Brain cancer patients.
+```{r results='show', message=F, warning=F, fig.align = 'center'}
+
+tab_model(lm1)
+
+```
+
+Plot of Effect sizes from model.
+```{r results= 'show', message=F, warning=F}
+
+plot_model(lm1, vline.color = "gray", sort.est = TRUE, type = "std", dot.size = 2, line.size = 1, bpe = "mean", bpe.style = "dot",
+           prob.inner = 0.4, prob.outer = 0.8)
+
+```
+
+Plot predictions from model for main fixed effects. Some interesting looking trends!
+
+* Age: Not surprisingly, survivial is relatively low when compared to patients who are young when receiving a diagnosis.
+* Sex: No apparent difference between male and female survival.
+* Time until first surgery: Interestingly, the time until first surgery seems to have quite a drastic effect on the probability of survival where the later a patient receives surgery, the lower the likelihood of survival.
+* Comorbidity measure: Strangely, patients with a severe comorbidity sruvive for longer. I was expecting the opposite!
+
+```{r results='show', message=F, warning=F, fig.width= 15, fig.height= 15}
+set_theme(base = theme_classic())
+
+## age
+lmp2 <- plot_model(lm1, type = "pred", terms = "age", title="Predicted Survial by Age")
+lmp2 <- lmp2 + (xlab("Age (years)")) + (ylab("Survival (days)"))
+
+## sex
+lmp3 <- plot_model(lm1, type = "pred", terms = "sex", title="Predicted Survial by Sex")
+lmp3 <- lmp3 + (xlab("Sex")) + (ylab("Survival (days)"))
+
+## timing of first surgery since diagnosis generally shows decrease in survival the longer a patient waits for surgery
+lmp4 <- plot_model(lm1, type = "pred", terms = "post_diag_surgery", title="Predicted Survial by Time Until First Surgery")
+lmp4 <- lmp4 + (xlab("Time to First Surgery (days)")) + (ylab("Survival (days)"))
+
+## comorbidities seems odd that severe comorbities would increase survival
+lmp5 <- plot_model(lm1, type = "pred", terms = "comorbid", title="Predicted Survial by Comorbidities")
+lmp5 <- lmp5 + (xlab("Comorbidities")) + (ylab("Survival (days)"))
+
+ggarrange(lmp2, lmp3, lmp4, lmp5, ncol = 2, nrow = 2)
+
+```
+
+
+Plot predictions from model for interactive effects.
+
+* Age x Comorbidity: There seems to be something interesting going on when we examine the interaction between age and comorbidity, particularly for patients who have severe comorbidities and are old who survive for a much shorter time when compared to young patients with severe comorbidities.
+* Age x Sex: Unsurprisingly, males and females both show similar declines in survival with increasing age upon diagnosis.
+* Age x Time until first surgery: This is interesting in that it shows that young brain cancer patients generally live for longer, regardless of the time delay until first surgery. On the other hand, older patients show a significant decrease if not operated on more quickly.
+* Sex x Time until first surgery: Males and females show the same trend for the interaction between time until first surgery where individuals who received surgery longer after first diagnosis date survived for a shorter time frame when compared to patients operated on in the early stages of detection.
+```{r results='show', message=F, warning=F, fig.width= 15, fig.height= 15}
+
+## age * comorbidity shows quite an interesting relationship for severe comorbidity.
+lmp6 <- plot_model(lm1, type = "pred", terms = c("age", "comorbid"), title="Predicted Survial by Age and Comorbidity")
+lmp6 <- lmp6 + (xlab("Age (years)")) + (ylab("Survival (days)"))
+
+## age * sex. nothing too surprising.
+lmp7 <- plot_model(lm1, type = "pred", terms = c("age", "sex"), title="Predicted Survial by Age and Sex")
+lmp7 <- lmp7 + (xlab("Age (years)")) + (ylab("Survival (days)"))
+
+## age * surgery time definitely an interaction here where people who have surgery later and are old have lower prob of survivial.
+lmp8 <- plot_model(lm1, type = "pred", terms = c("age", "post_diag_surgery"), title="Predicted Survial by Age \n and Time to First Surgery")
+lmp8 <- lmp8 + (xlab("Age (years)")) + (ylab("Survival (days)"))
+
+## surgery * sex
+lmp9 <- plot_model(lm1, type = "pred", terms = c("sex", "post_diag_surgery"), title="Predicted Survial by Sex \n and Time to First Surgery")
+lmp9 <- lmp9 + (xlab("Sex")) + (ylab("Survival (days)"))
+
+
+ggarrange(lmp6, lmp7, lmp8, lmp9, ncol = 2, nrow = 2)
+
+```
+
